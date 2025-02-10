@@ -5,7 +5,7 @@ import scipy.integrate as si
 cimport numpy as np
 cimport cython
 #from cython.parallel import prange
-from libc.math cimport sqrt,pow,sin,log10,abs,atan2
+from libc.math cimport sqrt,pow,sin,cos,log10,abs,atan2
 from libc.stdlib cimport malloc, free
 from cpython cimport bool
 
@@ -48,7 +48,13 @@ from cpython cimport bool
 #   [k,Pk,Nmodes]
 
 # test_number_modes_2D(grid)
+
+# ME: function to compute displacement field from the density field
+# compute_displacement(delta,BoxSize,MAS='CIC',threads=1, verbose=False)
+#    [delta_x,delta_y,delta_z]
 ##############################################################################
+
+print("Pk_library.pyx: ME version = 1.1, latest mod: 05/02/2025 | added interlacing in Pk")
 
 # This function determines the fundamental (kF) and Nyquist (kN) frequencies
 # It also finds the maximum frequency sampled in the box, the maximum 
@@ -71,26 +77,35 @@ def frequencies_2D(BoxSize,dims):
 # This function finds the MAS correction index and return the array used
 def MAS_function(MAS):
     MAS_index = 0;  #MAS_corr = np.ones(3,dtype=np.float64)
-    if MAS=='NGP':  MAS_index = 1
-    if MAS=='CIC':  MAS_index = 2
-    if MAS=='TSC':  MAS_index = 3
-    if MAS=='PCS':  MAS_index = 4
+    if MAS=='NGP':     MAS_index = 1
+    if MAS=='CIC':     MAS_index = 2
+    if MAS=='TSC':     MAS_index = 3
+    if MAS=='PCS':     MAS_index = 4
+    if MAS=='TOP-HAT': MAS_index = -1   #ME: For the case of a spherical top-hat in configuration space
+    # print(f'MAS correction ({MAS}) index = {MAS_index}')
     return MAS_index#,MAS_corr
 
 # This function implement the MAS correction to modes amplitude
 #@cython.cdivision(False)
 #@cython.boundscheck(False)
 cpdef inline double MAS_correction(double x, int MAS_index):
-    return (1.0 if (x==0.0) else pow(x/sin(x),MAS_index))
+    # ME: Added the case of a spherical top-hat in configuration space
+    # TODO: check if this extra if statement though, could make the code slower
+    if MAS_index == -1: 
+        return (1.0 if (x==0.0) else pow(x, 3)/( 3*( sin(x)-x*cos(x) ) ))
+    else:
+        return (1.0 if (x==0.0) else pow(x/sin(x),MAS_index))
 
 # This function checks that all independent modes have been counted
-def check_number_modes(Nmodes,dims):
+def check_number_modes(Nmodes,dims,log_binning=False):
     # (0,0,0) own antivector, while (n,n,n) has (-n,-n,-n) for dims odd
     if dims%2==1:  own_modes = 1 
     # (0,0,0),(0,0,n),(0,n,0),(n,0,0),(n,n,0),(n,0,n),(0,n,n),(n,n,n)
     else:          own_modes = 8 
     repeated_modes = (dims**3 - own_modes)//2  
     indep_modes    = repeated_modes + own_modes
+    # ME: If we are using log_binning, we need to remove the DC mode bin (which we skip in the computations)
+    if log_binning:  indep_modes -= 1
 
     if int(np.sum(Nmodes))!=indep_modes:
         print('WARNING: Not all modes counted')
@@ -261,7 +276,8 @@ def IFFT2Dr_d(np.complex128_t[:,:] a, int threads):
 @cython.cdivision(False)
 @cython.wraparound(False)
 class Pk:
-    def __init__(self,delta,BoxSize,int axis=2,MAS='CIC',threads=1, verbose=True):
+    def __init__(self,_delta,BoxSize,int axis=2,MAS='CIC',threads=1, verbose=True, 
+                log_binning=False, fix_bin_centers=True, interlacing=False):
 
         start = time.time()
         cdef int kxx, kyy, kzz, kx, ky, kz,dims, middle, k_index, MAS_index
@@ -271,54 +287,76 @@ class Pk:
         ####### change this for double precision ######
         cdef float MAS_factor
         cdef np.complex64_t[:,:,::1] delta_k
+        cdef float binfac
         ###############################################
         cdef np.float64_t[::1] k1D, kpar, kper, k3D, Pk1D, Pk2D, Pkphase
         cdef np.float64_t[::1] Nmodes1D, Nmodes2D, Nmodes3D
         cdef np.float64_t[:,::1] Pk3D 
+        ####### extra variables for interlacing #######
+        cdef np.complex64_t[:,:,::1] delta_k_shifted
+        ###############################################
 
+        # ME: if interlacing, we separate the two meshes here
+        if interlacing:
+            delta, delta_shifted = _delta
+        else:
+            delta = _delta
         # find dimensions of delta: we assume is a (dims,dims,dims) array
         # determine the different frequencies and the MAS_index
-        if verbose:  print('\nComputing power spectrum of the field...')
         dims = len(delta);  middle = dims//2
         kF,kN,kmax_par,kmax_per,kmax = frequencies(BoxSize,dims)
+        if verbose:  print('\nComputing power spectrum of the field with BoxSize = %.1f and ngrid = %d...'%(BoxSize,dims))
+        # if verbose:  print('\nDimensions = %d, middle = %d, kF = %.2f, kN = %.2f, kmax_par = %d, kmax_per = %d, kmax = %d'%(dims,middle,kF,kN,kmax_par,kmax_per,kmax))
         MAS_index = MAS_function(MAS)
 
         ## compute FFT of the field (change this for double precision) ##
         delta_k = FFT3Dr_f(delta,threads)
-        #################################
+        if interlacing:  
+            delta_k_shifted = FFT3Dr_f(delta_shifted,threads)
+        #################################################################
 
-        # define arrays containing k1D, Pk1D and Nmodes1D. We need kmax_par+1
-        # bins since modes go from 0 to kmax_par
-        k1D      = np.zeros(kmax_par+1, dtype=np.float64)
-        Pk1D     = np.zeros(kmax_par+1, dtype=np.float64)
-        Nmodes1D = np.zeros(kmax_par+1, dtype=np.float64)
-
-        # define arrays containing Pk2D and Nmodes2D
-        Pk2D     = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
-        Nmodes2D = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
-
-        # define arrays containing k3D, Pk3D and Nmodes3D. We need kmax+1
-        # bins since the mode (middle,middle, middle) has an index = kmax
-        k3D      = np.zeros(kmax+1,     dtype=np.float64)
-        Pk3D     = np.zeros((kmax+1,3), dtype=np.float64)
-        Pkphase  = np.zeros(kmax+1,     dtype=np.float64)
-        Nmodes3D = np.zeros(kmax+1,     dtype=np.float64)
+        # ME: Log binning so far only works for 3D P(k)
+        if log_binning:  # log_binning is done in bacco-style
+            k3D      = np.zeros(middle,     dtype=np.float64)
+            Pk3D     = np.zeros((middle,3), dtype=np.float64)
+            Pkphase  = np.zeros(middle,     dtype=np.float64)
+            Nmodes3D = np.zeros(middle,     dtype=np.float64)
+            kmax = middle + 1
+            binfac   = (middle-1)/log10(kmax)
+            if verbose:  print('You set log_binning = True, so I am only calculating the 3D P(k)')
+        else:
+            # define arrays containing k3D, Pk3D and Nmodes3D. We need kmax+1
+            # bins since the mode (middle,middle, middle) has an index = kmax
+            k3D      = np.zeros(kmax+1,     dtype=np.float64)
+            Pk3D     = np.zeros((kmax+1,3), dtype=np.float64)
+            Pkphase  = np.zeros(kmax+1,     dtype=np.float64)
+            Nmodes3D = np.zeros(kmax+1,     dtype=np.float64)
+            # define arrays containing k1D, Pk1D and Nmodes1D. We need kmax_par+1
+            # bins since modes go from 0 to kmax_par
+            k1D      = np.zeros(kmax_par+1, dtype=np.float64)
+            Pk1D     = np.zeros(kmax_par+1, dtype=np.float64)
+            Nmodes1D = np.zeros(kmax_par+1, dtype=np.float64)
+            # define arrays containing Pk2D and Nmodes2D
+            Pk2D     = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
+            Nmodes2D = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
 
 
         # do a loop over the independent modes.
         # compute k,k_par,k_per, mu for each mode. k's are in kF units
         start2 = time.time();  prefact = np.pi/dims
+        # ME: If we are using a spherical top-hat, we need to multiply k by R_sphere = BoxSize/dims
+        if MAS_index == -1:  prefact = kF*BoxSize/dims
         for kxx in range(dims):
             kx = (kxx-dims if (kxx>middle) else kxx)
-            MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
+            if MAS_index!=-1: MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)        # Need to modify this to correct for deconvolving on the fly
         
             for kyy in range(dims):
                 ky = (kyy-dims if (kyy>middle) else kyy)
-                MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
+                if MAS_index!=-1: MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
 
                 for kzz in range(middle+1): #kzz=[0,1,..,middle] --> kz>0
                     kz = (kzz-dims if (kzz>middle) else kzz)
-                    MAS_corr[2] = MAS_correction(prefact*kz,MAS_index)  
+                    if MAS_index!=-1: MAS_corr[2] = MAS_correction(prefact*kz,MAS_index)  
 
                     # kz=0 and kz=middle planes are special
                     if kz==0 or (kz==middle and dims%2==0):
@@ -329,7 +367,17 @@ class Pk:
 
                     # compute |k| of the mode and its integer part
                     k       = sqrt(kx*kx + ky*ky + kz*kz)
-                    k_index = <int>k
+                    
+                    # ME: avoid the DC mode if in log_binning
+                    if log_binning and k==0.0:  continue
+
+                    if log_binning:     # ME: log_binning is done in bacco-style
+                        k_index = <int>(log10(k)*binfac)
+                    else:
+                        k_index = <int>k
+
+                    # ME: avoid modes outside the sphere when in log_binning
+                    if log_binning and k_index>=middle:  continue
 
                     # compute the value of k_par and k_perp
                     if axis==0:   
@@ -348,26 +396,43 @@ class Pk:
                     if k_par<0:  k_par = -k_par
 
                     # correct modes amplitude for MAS
-                    MAS_factor = MAS_corr[0]*MAS_corr[1]*MAS_corr[2]
-                    delta_k[kxx,kyy,kzz] = delta_k[kxx,kyy,kzz]*MAS_factor
+                    MAS_factor = MAS_corr[0]*MAS_corr[1]*MAS_corr[2] if MAS_index!=-1 else MAS_correction(prefact*k,MAS_index) 
+                    # delta_k[kxx,kyy,kzz] = delta_k[kxx,kyy,kzz]*MAS_factor
 
                     # compute |delta_k|^2 of the mode
-                    real = delta_k[kxx,kyy,kzz].real
-                    imag = delta_k[kxx,kyy,kzz].imag
-                    delta2 = real*real + imag*imag
+                    # real = delta_k[kxx,kyy,kzz].real
+                    # imag = delta_k[kxx,kyy,kzz].imag
+
+                    # ME: interlacing implementation
+                    if interlacing:
+                        # delta_k_shifted[kxx,kyy,kzz] = delta_k_shifted[kxx,kyy,kzz]*MAS_factor
+                        real_shifted = delta_k_shifted[kxx,kyy,kzz].real
+                        imag_shifted = delta_k_shifted[kxx,kyy,kzz].imag
+                        exponent = (kx + ky + kz)*kF*(BoxSize/dims)/2.0       # This is the exponent of the phase shift (modulo -i)
+                        real_cos = cos(exponent)
+                        real_sin = sin(exponent)
+                        real = (delta_k[kxx,kyy,kzz].real + real_shifted*real_cos - imag_shifted*real_sin)#/2  # ME: the /2 is done at the end on the Pk
+                        imag = (delta_k[kxx,kyy,kzz].imag + imag_shifted*real_cos + real_shifted*real_sin)#/2
+                    else:
+                        real = delta_k[kxx,kyy,kzz].real
+                        imag = delta_k[kxx,kyy,kzz].imag
+                    ############################################
+
+                    delta2 = (real*real + imag*imag)*MAS_factor*MAS_factor
                     phase  = atan2(real, sqrt(delta2)) 
 
-                    # Pk1D: only consider modes with |k|<kF
-                    if k<=middle:
-                        k1D[k_par]      += k_par
-                        Pk1D[k_par]     += delta2
-                        Nmodes1D[k_par] += 1.0
+                    if not log_binning:
+                        # Pk1D: only consider modes with |k|<kF
+                        if k<=middle:
+                            k1D[k_par]      += k_par
+                            Pk1D[k_par]     += delta2
+                            Nmodes1D[k_par] += 1.0
 
-                    # Pk2D: P(k_per,k_par)
-                    # index_2D goes from 0 to (kmax_par+1)*(kmax_per+1)-1
-                    index_2D = (kmax_par+1)*k_per + k_par
-                    Pk2D[index_2D]     += delta2
-                    Nmodes2D[index_2D] += 1.0
+                        # Pk2D: P(k_per,k_par)
+                        # index_2D goes from 0 to (kmax_par+1)*(kmax_per+1)-1
+                        index_2D = (kmax_par+1)*k_per + k_par
+                        Pk2D[index_2D]     += delta2
+                        Nmodes2D[index_2D] += 1.0
 
                     # Pk3D.
                     k3D[k_index]      += k
@@ -376,48 +441,61 @@ class Pk:
                     Pk3D[k_index,2]   += (delta2*(35.0*mu2*mu2 - 30.0*mu2 + 3.0)/8.0)
                     Pkphase[k_index]  += (phase*phase)
                     Nmodes3D[k_index] += 1.0
-        if verbose:  print('Time to complete loop = %.2f'%(time.time()-start2))
+        if verbose:  print('Time to complete loop = %.2f'%(time.time()-start2), flush=True)
 
-        # Pk1D. Discard DC mode bin and give units
-        # the perpendicular modes sample an area equal to pi*kmax_per^2
-        # we assume that each mode has an area equal to pi*kmax_per^2/Nmodes
-        k1D  = k1D[1:];  Nmodes1D = Nmodes1D[1:];  Pk1D = Pk1D[1:]
-        for i in range(len(k1D)):
-            Pk1D[i] = Pk1D[i]*(BoxSize/dims**2)**3 #give units
-            k1D[i]  = (k1D[i]/Nmodes1D[i])*kF      #give units
-            kmaxper = sqrt(kN**2 - k1D[i]**2)
-            Pk1D[i] = Pk1D[i]*(np.pi*kmaxper**2/Nmodes1D[i])/(2.0*np.pi)**2
-        self.k1D = np.asarray(k1D);  self.Pk1D = np.asarray(Pk1D)
-        self.Nmodes1D = np.asarray(Nmodes1D  )
+        if not log_binning: # ME: for now we only do log_binning for 3D P(k)
+            # Pk1D. Discard DC mode bin and give units
+            # the perpendicular modes sample an area equal to pi*kmax_per^2
+            # we assume that each mode has an area equal to pi*kmax_per^2/Nmodes
+            k1D  = k1D[1:];  Nmodes1D = Nmodes1D[1:];  Pk1D = Pk1D[1:]
+            for i in range(len(k1D)):
+                Pk1D[i] = Pk1D[i]*(BoxSize/dims**2)**3 #give units
+                k1D[i]  = (k1D[i]/Nmodes1D[i])*kF      #give units
+                kmaxper = sqrt(kN**2 - k1D[i]**2)
+                Pk1D[i] = Pk1D[i]*(np.pi*kmaxper**2/Nmodes1D[i])/(2.0*np.pi)**2
+            self.k1D = np.asarray(k1D);  self.Pk1D = np.asarray(Pk1D)
+            self.Nmodes1D = np.asarray(Nmodes1D  )
 
-        # Pk2D. Keep DC mode bin, give units to Pk2D and find kpar & kper
-        kpar = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
-        kper = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
-        for k_par in range(kmax_par+1):
-            for k_per in range(kmax_per+1):
-                index_2D = (kmax_par+1)*k_per + k_par
-                kpar[index_2D] = 0.5*(k_par + k_par+1)*kF
-                kper[index_2D] = 0.5*(k_per + k_per+1)*kF
-        for i in range(len(kpar)):
-            Pk2D[i] = Pk2D[i]*(BoxSize/dims**2)**3/Nmodes2D[i]
-        self.kpar = np.asarray(kpar);  self.kper = np.asarray(kper)
-        self.Pk2D = np.asarray(Pk2D);  self.Nmodes2D = np.asarray(Nmodes2D)
+            # Pk2D. Keep DC mode bin, give units to Pk2D and find kpar & kper
+            kpar = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
+            kper = np.zeros((kmax_par+1)*(kmax_per+1), dtype=np.float64)
+            for k_par in range(kmax_par+1):
+                for k_per in range(kmax_per+1):
+                    index_2D = (kmax_par+1)*k_per + k_par
+                    kpar[index_2D] = 0.5*(k_par + k_par+1)*kF
+                    kper[index_2D] = 0.5*(k_per + k_per+1)*kF
+            for i in range(len(kpar)):
+                Pk2D[i] = Pk2D[i]*(BoxSize/dims**2)**3/Nmodes2D[i]
+            self.kpar = np.asarray(kpar);  self.kper = np.asarray(kper)
+            self.Pk2D = np.asarray(Pk2D);  self.Nmodes2D = np.asarray(Nmodes2D)
 
         # Pk3D. Check modes, discard DC mode bin and give units
         # we need to multiply the multipoles by (2*ell + 1)
-        check_number_modes(Nmodes3D,dims)
-        k3D  = k3D[1:];  Nmodes3D = Nmodes3D[1:];  Pk3D = Pk3D[1:,:]
-        Pkphase = Pkphase[1:]
+        # if verbose:  print('Counting modes...', flush=True)
+        # check_number_modes(Nmodes3D,dims,log_binning)
+        # if verbose: print('...OK', flush=True)
+        if not log_binning:
+            check_number_modes(Nmodes3D,dims)
+            k3D  = k3D[1:];  Nmodes3D = Nmodes3D[1:];  Pk3D = Pk3D[1:,:]
+            Pkphase = Pkphase[1:]
         for i in range(len(k3D)):
-            k3D[i]     = (k3D[i]/Nmodes3D[i])*kF
-            Pk3D[i,0]  = (Pk3D[i,0]/Nmodes3D[i])*(BoxSize/dims**2)**3
-            Pk3D[i,1]  = (Pk3D[i,1]*5.0/Nmodes3D[i])*(BoxSize/dims**2)**3
-            Pk3D[i,2]  = (Pk3D[i,2]*9.0/Nmodes3D[i])*(BoxSize/dims**2)**3
-            Pkphase[i] = (Pkphase[i]/Nmodes3D[i])*(BoxSize/dims**2)**3
+            if log_binning and fix_bin_centers:     # ME: log_binning is done in bacco-style
+                k3D[i] = 10**((i+0.5)/binfac)*kF
+            else:
+                if Nmodes3D[i]>0:
+                    k3D[i]     = (k3D[i]/Nmodes3D[i])*kF
+            if Nmodes3D[i]>0:
+                Pk3D[i,0]  = (Pk3D[i,0]/Nmodes3D[i])*(BoxSize/dims**2)**3
+                Pk3D[i,1]  = (Pk3D[i,1]*5.0/Nmodes3D[i])*(BoxSize/dims**2)**3
+                Pk3D[i,2]  = (Pk3D[i,2]*9.0/Nmodes3D[i])*(BoxSize/dims**2)**3
+                Pkphase[i] = (Pkphase[i]/Nmodes3D[i])*(BoxSize/dims**2)**3
         self.k3D = np.asarray(k3D);  self.Nmodes3D = np.asarray(Nmodes3D)
         self.Pk = np.asarray(Pk3D);  self.Pkphase = Pkphase
+        if interlacing:
+            # ME: we divide by 4 the Pk to account for the interlacing
+            self.Pk = self.Pk/4.0
 
-        if verbose:  print('Time taken = %.2f seconds'%(time.time()-start))
+        if verbose:  print('Time taken = %.2f seconds'%(time.time()-start), flush=True)
 ################################################################################
 ################################################################################
 
@@ -467,13 +545,15 @@ class Pk_plane:
         # do a loop over the independent modes.
         # compute k,k_par,k_per, mu for each mode. k's are in kF units
         start2 = time.time();  prefact = np.pi/grid
+        # ME: If we are using a spherical top-hat, we need to multiply k by R_sphere = BoxSize/dims
+        if MAS_index == -1:  prefact = kF*BoxSize/grid
         for kxx in range(grid):
             kx = (kxx-grid if (kxx>middle) else kxx)
-            MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
-
+            if MAS_index!=-1: MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
+        
             for kyy in range(middle+1): #kyy=[0,1,..,middle] --> ky>0
                 ky = (kyy-grid if (kyy>middle) else kyy)
-                MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
+                if MAS_index!=-1: MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)  
 
                 # ky=0 & ky=middle are special (modes with (kx<0, ky=0) are not
                 # independent of (kx>0, ky=0): delta(-k)=delta*(+k))
@@ -485,7 +565,7 @@ class Pk_plane:
                 k_index = <int>k
 
                 # correct modes amplitude for MAS
-                MAS_factor = MAS_corr[0]*MAS_corr[1]
+                MAS_factor = MAS_corr[0]*MAS_corr[1] if MAS_index!=-1 else MAS_correction(prefact*k,MAS_index)
                 delta_k[kxx,kyy] = delta_k[kxx,kyy]*MAS_factor
 
                 # compute |delta_k|^2 of the mode
@@ -1235,11 +1315,13 @@ class XPk_plane:
 # threads -----> number of threads (OMP) used to make the FFTW
 #@cython.boundscheck(False)
 #@cython.cdivision(False)
-def Pk_theta(Vx,Vy,Vz,BoxSize,axis=2,MAS='CIC',threads=1):
+def Pk_theta(_Vx,_Vy,_Vz,BoxSize,axis=2,MAS='CIC',threads=1, 
+             ngrid_CIC=None, ngrid_CIC2=None, log_binning=False, 
+             fix_bin_centers=True, verbose=False, interlacing=False):      
 
     start = time.time()
-    cdef int kxx,kyy,kzz,kx,ky,kz,dims,middle,k_index,kmax,MAS_index
-    cdef double kmod,prefact,real,imag,theta2
+    cdef int kxx,kyy,kzz,kx,ky,kz,dims,middle,k_index,kmax,MAS_index,MAS_index2
+    cdef double kmod,prefact,prefact2,real,imag,theta2
     ####### change this for double precision ######
     cdef float MAS_factor
     cdef np.ndarray[np.complex64_t,ndim=3] Vx_k,Vy_k,Vz_k
@@ -1247,12 +1329,28 @@ def Pk_theta(Vx,Vy,Vz,BoxSize,axis=2,MAS='CIC',threads=1):
     cdef np.ndarray[np.float64_t,ndim=1] k,Nmodes,MAS_corr
     cdef np.ndarray[np.float64_t,ndim=1] Pk 
 
+    # ME: if interlacing, we separate the two meshes here
+    if interlacing:
+        Vx, Vx_shifted = _Vx
+        Vy, Vy_shifted = _Vy
+        Vz, Vz_shifted = _Vz
+    else:
+        Vx = _Vx;  Vy = _Vy;  Vz = _Vz
+
     # find dimensions of delta: we assuming is a (dims,dims,dims) array
     # determine the different frequencies, the MAS_index and the MAS_corr
-    print('Computing power spectrum of theta...')
+    if verbose: print('Computing power spectrum of theta...')
     dims = len(Vx);  middle = dims//2
     kF,kN,kmax_par,kmax_per,kmax = frequencies(BoxSize,dims)
+    # ME: Added option for double deconvolution
     MAS_index = MAS_function(MAS)
+    double_deconvolution = False
+    if MAS is not None:
+        if '+' in MAS:
+            MAS = MAS.split('+')
+            MAS_index = MAS_function(MAS[0])
+            MAS_index2 = MAS_function(MAS[1])
+            double_deconvolution = True
     MAS_corr = np.ones(3, dtype=np.float64)
                 
     ## compute FFT of the field (change this for double precision) ##
@@ -1260,27 +1358,61 @@ def Pk_theta(Vx,Vy,Vz,BoxSize,axis=2,MAS='CIC',threads=1):
     Vx_k = FFT3Dr_f(Vx,threads)
     Vy_k = FFT3Dr_f(Vy,threads)
     Vz_k = FFT3Dr_f(Vz,threads)
+    if interlacing:
+        Vx_k_shifted = FFT3Dr_f(Vx_shifted,threads)
+        Vy_k_shifted = FFT3Dr_f(Vy_shifted,threads)
+        Vz_k_shifted = FFT3Dr_f(Vz_shifted,threads)
     #################################
 
-    # define arrays containing k, Pk0,Pk2,Pk4 and Nmodes. We need kmax+1
-    # bins since the mode (middle,middle, middle) has an index = kmax
-    k      = np.zeros(kmax+1,dtype=np.float64)
-    Pk     = np.zeros(kmax+1,dtype=np.float64)
-    Nmodes = np.zeros(kmax+1,dtype=np.float64)
+    if log_binning:  # ME: log_binning is done in bacco-style
+        k      = np.zeros(middle, dtype=np.float64)
+        Pk     = np.zeros(middle, dtype=np.float64)
+        Nmodes = np.zeros(middle, dtype=np.float64)
+        kmax = middle + 1
+        binfac   = (middle-1)/log10(kmax)
+        if verbose: print('You set log_binning = True, so I am only calculating the 3D P(k)')
+    else:
+        # define arrays containing k, Pk0,Pk2,Pk4 and Nmodes. We need kmax+1
+        # bins since the mode (middle,middle, middle) has an index = kmax
+        k      = np.zeros(kmax+1,dtype=np.float64)
+        Pk     = np.zeros(kmax+1,dtype=np.float64)
+        Nmodes = np.zeros(kmax+1,dtype=np.float64)
 
     # do a loop over all modes, computing their k,Pk. k's are in k_F units
-    start2 = time.time();  prefact = np.pi/dims
+    start2 = time.time();  prefact = np.pi/dims; prefact2 = np.pi/dims
+    # ME: If we are using a spherical top-hat, we need to multiply k by R_sphere = BoxSize/dims
+    if MAS_index == -1:  prefact = kF*BoxSize/dims
+    if double_deconvolution:
+        if MAS_index2 == -1:  
+            prefact2 = kF*BoxSize/dims
+    # ME: If ngrid_CIC is given, the deconvolution is done according to this ngrid
+    if ngrid_CIC is not None:
+        if MAS_index == 2:
+            prefact *= dims/ngrid_CIC
+    if ngrid_CIC2 is not None:
+        if double_deconvolution and MAS_index2 == 2:
+            prefact2 *= dims/ngrid_CIC2
     for kxx in range(dims):
+        if verbose:
+            # Check progress printing out when 10, 20, ..., 100% of the loops are done
+            if kxx%(dims//10)==0:  print('Counting modes: %d%%'%(100*kxx/dims), flush=True)
+
         kx = (kxx-dims if (kxx>middle) else kxx)
-        MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
+        MAS_corr[0] = MAS_correction(prefact*kx,MAS_index) if MAS_index!=-1 else 1.0
+        if double_deconvolution:
+            MAS_corr[0] *= MAS_correction(prefact2*kx,MAS_index2) if MAS_index2!=-1 else 1.0
         
         for kyy in range(dims):
             ky = (kyy-dims if (kyy>middle) else kyy)
-            MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
+            MAS_corr[1] = MAS_correction(prefact*ky,MAS_index) if MAS_index!=-1 else 1.0
+            if double_deconvolution:
+                MAS_corr[1] *= MAS_correction(prefact2*ky,MAS_index2) if MAS_index2!=-1 else 1.0
 
             for kzz in range(middle+1): #kzz=[0,1,..,middle] --> kz>0
                 kz = (kzz-dims if (kzz>middle) else kzz)
-                MAS_corr[2] = MAS_correction(prefact*kz,MAS_index)  
+                MAS_corr[2] = MAS_correction(prefact*kz,MAS_index) if MAS_index!=-1 else 1.0
+                if double_deconvolution:
+                    MAS_corr[2] *= MAS_correction(prefact2*kz,MAS_index2) if MAS_index2!=-1 else 1.0
 
                 # kz=0 and kz=middle planes are special
                 if kz==0 or (kz==middle and dims%2==0):
@@ -1290,38 +1422,72 @@ def Pk_theta(Vx,Vy,Vz,BoxSize,axis=2,MAS='CIC',threads=1):
 
                 # compute |k| of the mode and its integer part
                 kmod    = sqrt(kx*kx + ky*ky + kz*kz)
-                k_index = <int>kmod
+
+                # ME: avoid the DC mode if in log_binning
+                if log_binning and kmod==0.0:  continue
+
+                if log_binning:     # ME: log_binning is done in bacco-style
+                    k_index = <int>(log10(kmod)*binfac)
+                else:
+                    k_index = <int>kmod
+
+                # ME: avoid modes outside the sphere when in log_binning
+                if log_binning and k_index>=middle:  continue
 
                 # correct modes amplitude for MAS
                 MAS_factor = MAS_corr[0]*MAS_corr[1]*MAS_corr[2]
-                Vx_k[kxx,kyy,kzz] = Vx_k[kxx,kyy,kzz]*MAS_factor
-                Vy_k[kxx,kyy,kzz] = Vy_k[kxx,kyy,kzz]*MAS_factor
-                Vz_k[kxx,kyy,kzz] = Vz_k[kxx,kyy,kzz]*MAS_factor
-                #delta_k[kxx,kyy,kzz] = delta_k[kxx,kyy,kzz]*MAS_factor
+                if MAS_index == -1:
+                    MAS_factor *= MAS_correction(prefact*kmod,MAS_index)
+                if double_deconvolution:
+                    if MAS_index2 == -1:
+                        MAS_factor *= MAS_correction(prefact2*kmod,MAS_index2)
 
-                # compute theta for each mode: theta(k) = ik*V(k)
-                real = -(kx*Vx_k[kxx,kyy,kzz].imag + \
-                         ky*Vy_k[kxx,kyy,kzz].imag + \
-                         kz*Vz_k[kxx,kyy,kzz].imag)
-            
-                imag = kx*Vx_k[kxx,kyy,kzz].real + \
-                       ky*Vy_k[kxx,kyy,kzz].real + \
-                       kz*Vz_k[kxx,kyy,kzz].real
+                # ME: interlacing implementation
+                if interlacing:
+                    exponent = (kx + ky + kz)*kF*(BoxSize/dims)/2.0       # This is the exponent of the phase shift (modulo -i)
+                    real_cos = cos(exponent)
+                    real_sin = sin(exponent)
+                    real = -(kx*(Vx_k[kxx,kyy,kzz].imag + Vx_k_shifted[kxx,kyy,kzz].imag*real_cos + Vx_k_shifted[kxx,kyy,kzz].real*real_sin) + \
+                             ky*(Vy_k[kxx,kyy,kzz].imag + Vy_k_shifted[kxx,kyy,kzz].imag*real_cos + Vy_k_shifted[kxx,kyy,kzz].real*real_sin) + \
+                             kz*(Vz_k[kxx,kyy,kzz].imag + Vz_k_shifted[kxx,kyy,kzz].imag*real_cos + Vz_k_shifted[kxx,kyy,kzz].real*real_sin))
+                    imag =   kx*(Vx_k[kxx,kyy,kzz].real + Vx_k_shifted[kxx,kyy,kzz].real*real_cos - Vx_k_shifted[kxx,kyy,kzz].imag*real_sin) + \
+                             ky*(Vy_k[kxx,kyy,kzz].real + Vy_k_shifted[kxx,kyy,kzz].real*real_cos - Vy_k_shifted[kxx,kyy,kzz].imag*real_sin) + \
+                             kz*(Vz_k[kxx,kyy,kzz].real + Vz_k_shifted[kxx,kyy,kzz].real*real_cos - Vz_k_shifted[kxx,kyy,kzz].imag*real_sin)
+                else:
+                    real = -(kx*Vx_k[kxx,kyy,kzz].imag + \
+                             ky*Vy_k[kxx,kyy,kzz].imag + \
+                             kz*Vz_k[kxx,kyy,kzz].imag)
+                    imag =   kx*Vx_k[kxx,kyy,kzz].real + \
+                             ky*Vy_k[kxx,kyy,kzz].real + \
+                             kz*Vz_k[kxx,kyy,kzz].real
+                ############################################
+
+                # real = -(kx*Vx_k_imag + ky*Vy_k_imag + kz*Vz_k_imag)
+                # imag = kx*Vx_k_real + ky*Vy_k_real + kz*Vz_k_real
                 
-                theta2 = real*real + imag*imag
+                theta2 = (real*real + imag*imag)*MAS_factor*MAS_factor
 
                 # add mode to the k,Pk and Nmodes arrays
                 k[k_index]      += kmod
                 Pk[k_index]     += theta2
                 Nmodes[k_index] += 1.0
-    print('Time compute modulus = %.2f'%(time.time()-start2))
+    if verbose: print('Time compute modulus = %.2f'%(time.time()-start2))
 
     # check modes, discard fundamental frequency bin and give units
     # we need to multiply the multipoles by (2*ell + 1)
-    check_number_modes(Nmodes,dims)
-    k  = k[1:];    Nmodes = Nmodes[1:];   k = (k/Nmodes)*kF; 
-    Pk = Pk[1:]*(BoxSize/dims**2)**3*kF**2;  Pk *= (1.0/Nmodes);
-    print('Time taken = %.2f seconds'%(time.time()-start))
+    if not log_binning:
+        check_number_modes(Nmodes,dims)
+        k  = k[1:];    Nmodes = Nmodes[1:];   Pk = Pk[1:]
+    for i in range(len(k)):
+        if Nmodes[i]>0:
+            Pk[i] = Pk[i]*(1.0/Nmodes[i])*(BoxSize/dims**2)**3*kF**2
+            if interlacing:
+                Pk[i] /= 4.0
+            k[i] = (k[i]/Nmodes[i])*kF
+        if log_binning and fix_bin_centers:     # ME: log_binning is done in bacco-style
+            k[i] = 10**((i+0.5)/binfac)*kF
+
+    if verbose: print('Time taken = %.2f seconds'%(time.time()-start))
 
     return k,Pk,Nmodes
 ################################################################################
@@ -1879,7 +2045,7 @@ def XPk_2D(delta1,delta2,BoxSize,axis=2,MAS1='CIC',MAS2='CIC',threads=1):
 @cython.boundscheck(False)
 @cython.cdivision(False)
 @cython.wraparound(False)
-def correct_MAS(delta,BoxSize,MAS='CIC',threads=1):
+def correct_MAS(delta,BoxSize,MAS='CIC',threads=1,R_sphere=None):
 
     start = time.time()
     cdef int kxx, kyy, kzz, kx, ky, kz, dims, middle, MAS_index
@@ -1897,6 +2063,8 @@ def correct_MAS(delta,BoxSize,MAS='CIC',threads=1):
     dims = len(delta);  middle = dims//2
     kF,kN,kmax_par,kmax_per,kmax = frequencies(BoxSize,dims)
     MAS_index = MAS_function(MAS)
+    if MAS_index == -1 and R_sphere is None:
+        raise Exception("If you choose MAS='top-hat' you need to also pass the radius of the sphere!")
     
     ## compute FFT of the field (change this for double precision) ##
     delta_k = FFT3Dr_f(delta,threads)
@@ -1906,17 +2074,27 @@ def correct_MAS(delta,BoxSize,MAS='CIC',threads=1):
     # do a loop over the independent modes.
     # compute k,k_par,k_per, mu for each mode. k's are in kF units
     start2 = time.time();  prefact = np.pi/dims
+    # if we are correcting for a spherical top-hat kernel, we need to pass also the radius of the sphere
+    if R_sphere is not None: prefact = kF*R_sphere
     for kxx in range(dims):
         kx = (kxx-dims if (kxx>middle) else kxx)
-        MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
+        if MAS_index != -1:
+            MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
         
         for kyy in range(dims):
             ky = (kyy-dims if (kyy>middle) else kyy)
-            MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
+            if MAS_index != -1:
+                MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
 
             for kzz in range(middle+1): #kzz=[0,1,..,middle] --> kz>0
                 kz = (kzz-dims if (kzz>middle) else kzz)
-                MAS_corr[2] = MAS_correction(prefact*kz,MAS_index)  
+                if MAS_index != -1:
+                    MAS_corr[2] = MAS_correction(prefact*kz,MAS_index) 
+                    MAS_factor = MAS_corr[0]*MAS_corr[1]*MAS_corr[2] 
+                else:
+                    kmod = sqrt(kx*kx + ky*ky + kz*kz)
+                    MAS_factor = MAS_correction(prefact*kmod, MAS_index)
+
 
                 # kz=0 and kz=middle planes are special
                 if kz==0 or (kz==middle and dims%2==0):
@@ -1942,6 +2120,112 @@ def correct_MAS(delta,BoxSize,MAS='CIC',threads=1):
 
 ################################################################################
 ################################################################################
+# ME: I added this routine for getting a fake velocity field (linear)
+# This routine takes a density field in real-space, Fourier transform it to get 
+# it in Fourier-space and then use it to compute the displacement field. It then
+# Fourier transform back and return the displacement field in real-space 
+# delta -------> 3D density field: (dims,dims,dims) numpy array
+# BoxSize -----> size of the cubic density field
+# MAS ---------> mass assignment scheme used to compute density field
+#                needed to correct modes amplitude
+# threads -----> number of threads (OMP) used to make the FFTW
+@cython.boundscheck(False)
+@cython.cdivision(False)
+@cython.wraparound(False)
+def compute_displacement(delta,BoxSize,MAS='CIC',threads=1, verbose=False):
+
+    start = time.time()
+    cdef int kxx, kyy, kzz, kx, ky, kz, dims, middle, MAS_index
+    cdef int kmax_par, kmax_per, kmax, i
+    cdef double k, prefact
+    cdef double MAS_corr[3]
+    ####### change this for double precision ######
+    cdef float MAS_factor
+    cdef np.complex64_t[:,:,::1] delta_k
+    cdef np.complex64_t[:,:,::1] dx_k, dy_k, dz_k
+    cdef np.ndarray[np.float32_t,ndim=3] dx, dy, dz
+    ###############################################
+
+    # find dimensions of delta: we assume is a (dims,dims,dims) array
+    # determine the different frequencies and the MAS_index
+    if verbose: print('\nComputing the displacement field...')
+    dims = len(delta);  middle = dims//2
+    kF,kN,kmax_par,kmax_per,kmax = frequencies(BoxSize,dims)
+    MAS_index = MAS_function(MAS)
+    
+    ## compute FFT of the field (change this for double precision) ##
+    delta_k = FFT3Dr_f(delta,threads)
+    #################################
+
+    ## initialize the displacement vectors
+    dx_k = np.zeros_like(delta_k, dtype=np.complex64)
+    dy_k = np.zeros_like(delta_k, dtype=np.complex64)
+    dz_k = np.zeros_like(delta_k, dtype=np.complex64)
+
+    # do a loop over the independent modes.
+    # compute k,k_par,k_per, mu for each mode. k's are in kF units
+    start2 = time.time();  prefact = np.pi/dims
+    # ME: If we are using a spherical top-hat, we need to multiply k by R_sphere = BoxSize/dims
+    if MAS_index == -1:  prefact = kF*BoxSize/dims
+    for kxx in range(dims):
+        kx = (kxx-dims if (kxx>middle) else kxx)
+        if MAS_index != -1:  MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
+        
+        for kyy in range(dims):
+            ky = (kyy-dims if (kyy>middle) else kyy)
+            if MAS_index != -1:  MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
+
+            for kzz in range(middle+1): #kzz=[0,1,..,middle] --> kz>0
+                kz = (kzz-dims if (kzz>middle) else kzz)
+                if MAS_index != -1:  MAS_corr[2] = MAS_correction(prefact*kz,MAS_index)  
+
+                # kz=0 and kz=middle planes are special
+                # if kz==0 or (kz==middle and dims%2==0):
+                #     if kx<0: continue
+                #     elif kx==0 or (kx==middle and dims%2==0):
+                #         if ky<0.0: continue
+                
+                # Maybe I have to do something special and set to 0 the imaginary part of some modes. 
+                # But for now, I will just leave it like this.
+
+                # compute |k| of the mode and its integer part
+                kmod2    = kx*kx + ky*ky + kz*kz
+                kmod     = sqrt(kmod2)
+                k_index  = <int> kmod
+
+                # correct modes amplitude for MAS
+                MAS_factor = MAS_corr[0]*MAS_corr[1]*MAS_corr[2] if MAS_index!=-1 else MAS_correction(prefact*kmod,MAS_index)
+                delta_k[kxx,kyy,kzz] = delta_k[kxx,kyy,kzz]*MAS_factor
+
+                # compute Zeldovich displacements
+                if kmod2 == 0:
+                    dx_k[kxx,kyy,kzz] = 0.0
+                    dy_k[kxx,kyy,kzz] = 0.0
+                    dz_k[kxx,kyy,kzz] = 0.0
+                else:
+                    dx_k[kxx,kyy,kzz] = -complex(0, 1)*kx*delta_k[kxx,kyy,kzz]/kmod2
+                    dy_k[kxx,kyy,kzz] = -complex(0, 1)*ky*delta_k[kxx,kyy,kzz]/kmod2
+                    dz_k[kxx,kyy,kzz] = -complex(0, 1)*kz*delta_k[kxx,kyy,kzz]/kmod2
+
+    if verbose: print('Time to complete loop = %.2f'%(time.time()-start2))
+
+    ## compute IFFT of the field (change this for double precision) ##
+    dx = IFFT3Dr_f(dx_k,threads)
+    dy = IFFT3Dr_f(dy_k,threads)
+    dz = IFFT3Dr_f(dz_k,threads)
+    #################################
+
+    ## give units
+    dx /= kF; dy /= kF; dz /= kF
+
+    if verbose: print('Time taken = %.2f seconds'%(time.time()-start))
+
+    return dx, dy, dz
+################################################################################
+################################################################################
+
+################################################################################
+################################################################################
 # This function computes the expected k, Pk for a cubic box with a resolution
 # of dims^3 given an input Pk. This routine can be used when comparing the Pk
 # from a simulation against expected one from linear theory or PT
@@ -1950,23 +2234,36 @@ def correct_MAS(delta,BoxSize,MAS='CIC',threads=1):
 # BoxSize -----> size of the cubic box
 # dims --------> grid size
 # bins --------> number of bins in the interpolated Pk
+# ME: added options
+# log_binning -> if True, it will do log_binning in the Pk
+# MAS ---------> mass assignment scheme to mimick convolution
 @cython.boundscheck(False)
 @cython.cdivision(True)
 @cython.wraparound(False)
 def expected_Pk(np.float32_t[:] k_in, np.float32_t[:] Pk_in, 
-                float BoxSize, int dims, int bins=750):
+                float BoxSize, int dims, int bins=750, log_binning=False, MAS=None):
 
     cdef int k_len, i, j
-    cdef int kx, kxx, ky, kyy, kz, kzz, middle, k_index
+    cdef int kx, kxx, ky, kyy, kz, kzz, middle, k_index, MAS_index
     cdef float kF, kN, k0, k, Pk_interp
-    cdef float kmin_in, kmax_in, deltak
+    cdef float kmin_in, kmax_in, deltak, binfac
     cdef np.float64_t[::1] k3D, Pk3D, Nmodes3D
     cdef np.float32_t[::1] k_in_interp, Pk_in_interp
+    cdef double MAS_corr[3]
+    ####### change this for double precision ######
+    cdef float MAS_factor
+    cdef double prefact
 
     start2 = time.time()
 
     middle = dims//2
     kF,kN,kmax_par,kmax_per,kmax = frequencies(BoxSize,dims)
+
+    if MAS is not None:
+        MAS_index = MAS_function(MAS)
+        prefact = np.pi/dims
+        # ME: If we are using a spherical top-hat, we need to multiply k by R_sphere = BoxSize/dims
+        if MAS_index == -1:  prefact = kF*BoxSize/dims
 
     # check if input Pk is sorted
     k_len = k_in.shape[0]
@@ -1994,21 +2291,31 @@ def expected_Pk(np.float32_t[:] k_in, np.float32_t[:] Pk_in,
 
     # define arrays containing k3D, Pk3D and Nmodes3D. We need kmax+1
     # bins since the mode (middle,middle, middle) has an index = kmax
-    k3D      = np.zeros(kmax+1, dtype=np.float64)
-    Pk3D     = np.zeros(kmax+1, dtype=np.float64)
-    Nmodes3D = np.zeros(kmax+1, dtype=np.float64)
+    if log_binning:  # log_binning is done in bacco-style
+        k3D      = np.zeros(middle, dtype=np.float64)
+        Pk3D     = np.zeros(middle, dtype=np.float64)
+        Nmodes3D = np.zeros(middle, dtype=np.float64)
+        kmax = middle + 1
+        binfac   = (middle-1)/log10(kmax)
+    else:
+        k3D      = np.zeros(kmax+1, dtype=np.float64)
+        Pk3D     = np.zeros(kmax+1, dtype=np.float64)
+        Nmodes3D = np.zeros(kmax+1, dtype=np.float64)
 
 
     # do a loop over the independent modes.
     # compute k,k_par,k_per, mu for each mode. k's are in kF units
     for kxx in range(dims):
         kx = (kxx-dims if (kxx>middle) else kxx)
+        if MAS is not None:  MAS_corr[0] = MAS_correction(prefact*kx,MAS_index)
         
         for kyy in range(dims):
             ky = (kyy-dims if (kyy>middle) else kyy)
+            if MAS is not None:  MAS_corr[1] = MAS_correction(prefact*ky,MAS_index)
 
             for kzz in range(middle+1): #kzz=[0,1,..,middle] --> kz>0
                 kz = (kzz-dims if (kzz>middle) else kzz)
+                if MAS is not None:  MAS_corr[2] = MAS_correction(prefact*kz,MAS_index)
 
                 # kz=0 and kz=middle planes are special
                 if kz==0 or (kz==middle and dims%2==0):
@@ -2019,7 +2326,13 @@ def expected_Pk(np.float32_t[:] k_in, np.float32_t[:] Pk_in,
 
                 # compute |k| of the mode and its integer part
                 k       = sqrt(kx*kx + ky*ky + kz*kz)
-                k_index = <int>k
+                if log_binning:     # ME: log_binning is done in bacco-style
+                    k_index = <int>(log10(k)*binfac)
+                else:
+                    k_index = <int>k
+
+                # ME: avoid modes outside the sphere when in log_binning
+                if log_binning and k_index>=middle:  continue
 
                 # avoid the DC mode
                 if k==0.0:  continue
@@ -2031,15 +2344,24 @@ def expected_Pk(np.float32_t[:] k_in, np.float32_t[:] Pk_in,
                 i = <int>((log10(k) - log10(kmin_in))/deltak)
                 Pk_interp = (Pk_in_interp[i+1]-Pk_in_interp[i])/(k_in_interp[i+1]-k_in_interp[i])*(k-k_in_interp[i]) + Pk_in_interp[i]
 
+                # eventually convolve with MAS
+                if MAS is not None:
+                    MAS_factor = MAS_corr[0]*MAS_corr[1]*MAS_corr[2] if MAS_index!=-1 else MAS_correction(prefact*k,MAS_index)
+                    Pk_interp /= MAS_factor**2   # squared because we are applying it directly on the Pk
+
                 # Pk3D
                 k3D[k_index]      += k
                 Pk3D[k_index]     += Pk_interp
                 Nmodes3D[k_index] += 1.0
 
     # final post-processing
-    k3D  = k3D[1:];  Nmodes3D = Nmodes3D[1:];  Pk3D = Pk3D[1:]
+    if not log_binning:
+        k3D  = k3D[1:];  Nmodes3D = Nmodes3D[1:];  Pk3D = Pk3D[1:]
     for i in range(k3D.shape[0]):
-        k3D[i]  = (k3D[i]/Nmodes3D[i])
+        if log_binning:     # ME: log_binning is done in bacco-style
+            k3D[i] = 10**((i+0.5)/binfac)*kF
+        else:
+            k3D[i]  = (k3D[i]/Nmodes3D[i])
         Pk3D[i] = (Pk3D[i]/Nmodes3D[i])
 
     print('Time take = %.2f'%(time.time()-start2))
