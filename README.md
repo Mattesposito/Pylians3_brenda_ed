@@ -1,20 +1,14 @@
-# Pylians3
+# Pylians3 - Brenda edition
 
-Pylians stands for **Py**thon **li**braries for the **a**nalysis of **n**umerical **s**imulations. 
+This is a Pylians3 fork that contains some minor modifications in the Pk library to include interlacing, log binning, etc...
 
 ## Installation
-
-For the stable version do:
-
-``` sh
-python -m pip install Pylians
-```
 
 For the development version do
 
 ```sh 
-git clone https://github.com/franciscovillaescusa/Pylians3.git
-cd Pylians3
+git clone https://github.com/Mattesposito/Pylians3_brenda_ed.git
+cd Pylians3_brenda_ed
 python -m pip install .
 ```
 
